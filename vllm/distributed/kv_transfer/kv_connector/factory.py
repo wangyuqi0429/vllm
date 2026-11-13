@@ -233,7 +233,8 @@ KVConnectorFactory.register_connector(
     "MooncakeConnector",
 )
 KVConnectorFactory.register_connector(
-    "MooncakeLayerwiseConnector",
+    # Keep the original name available for the Ascend plugin registration.
+    "MooncakeLayerwiseUpstreamConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_layerwise_connector",
     "MooncakeLayerwiseConnector",
 )
