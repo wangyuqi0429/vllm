@@ -2018,7 +2018,7 @@ class MooncakeConnectorWorker:
     def _preserve_cache_region_identity(self) -> bool:
         return False
 
-    def _physical_blocks_for_spec(self, spec: KVCacheSpec) -> int:
+    def _physical_blocks_for_group(self, group_index: int) -> int:
         return self._physical_blocks_per_logical_kv_block
 
     def _logical_to_kernel_block_ids(
@@ -2466,12 +2466,12 @@ class MooncakeConnectorWorker:
                 if isinstance(layer_spec, AttentionSpec) and block_is_contiguous:
                     assert (
                         layer_spec.page_size_bytes
-                        % self._physical_blocks_for_spec(layer_spec)
+                        % self._physical_blocks_for_group(group_index)
                         == 0
                     )
                     kv_block_len = (
                         layer_spec.page_size_bytes
-                        // self._physical_blocks_for_spec(layer_spec)
+                        // self._physical_blocks_for_group(group_index)
                     )
                 elif isinstance(layer_spec, MambaSpec) and block_is_contiguous:
                     kv_block_len = layer_spec.page_size_bytes

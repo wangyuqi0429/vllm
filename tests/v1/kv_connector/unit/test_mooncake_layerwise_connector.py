@@ -7,6 +7,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Barrier
+from queue import SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -18,11 +19,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     mooncake_layerwise_connector as lw,
 )
 from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
-    KVCacheGroupSpec,
-    UniformTypeKVCacheSpecs,
+    KVCacheGroup,
+    ManagerConfig,
 )
+
+
+def _full_attention_group(specs: dict[str, lw.AttentionSpec]) -> KVCacheGroup:
+    return KVCacheGroup(
+        kv_cache_specs=specs,
+        manager_config=ManagerConfig(
+            FullAttentionManager, FullAttentionManager.Params()
+        ),
+        block_size=16,
+    )
 
 
 def test_partial_pp_alignment_preserves_matching_cache_names():
@@ -73,16 +85,20 @@ def worker():
     w.logical_block_size = w.block_size = 16
     w._physical_blocks_per_logical_kv_block = 1
     w._kernel_block_ratios = (1,)
+    w._kv_lease_duration = None
+    w._lease_renewals = SimpleQueue()
     w.tp_size = 1
     w.tp_rank = 0
     w.use_mla = False
-    spec = lw.FullAttentionSpec(
+    spec = lw.AttentionSpec(
         block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
     )
     w.kv_cache_config = KVCacheConfig(
         num_blocks=100,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer0", "layer1"], spec)],
+        kv_cache_groups=[
+            _full_attention_group(dict.fromkeys(("layer0", "layer1"), spec))
+        ],
     )
     w._layer_specs = dict.fromkeys(["layer0", "layer1"], spec)
     w.vllm_config = SimpleNamespace(
@@ -211,12 +227,13 @@ def test_scheduler_snapshots_updated_blocks():
         num_blocks=100,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer0"],
-                lw.FullAttentionSpec(
-                    block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
-                ),
-            )
+            _full_attention_group(
+                {
+                    "layer0": lw.AttentionSpec(
+                        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+                    )
+                }
+            ),
         ],
     )
     request = SimpleNamespace(
@@ -816,7 +833,7 @@ def test_attention_hook_sends_same_layer_indexer_before_forward_end(
     worker.kv_cache_config = KVCacheConfig(
         num_blocks=100,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(names, spec)],
+        kv_cache_groups=[_full_attention_group(dict.fromkeys(names, spec))],
     )
     meta = msgspec.structs.replace(
         _metadata(), registered_layer_names=names, registered_layer_indices=[7, 7]
@@ -858,21 +875,21 @@ def test_attention_hook_sends_same_layer_indexer_before_forward_end(
 
 
 @pytest.mark.parametrize("uniform", [False, True])
-def test_connector_accepts_full_attention_subclasses_and_uniform_specs(uniform):
-    class IndexerSpec(lw.FullAttentionSpec):
+def test_connector_accepts_attention_subclasses_in_transfer_groups(uniform):
+    class IndexerSpec(lw.AttentionSpec):
         pass
 
     specs = {
         name: cls(block_size=16, num_kv_heads=1, head_size=width, dtype=torch.float16)
         for name, cls, width in [
-            ("model.layers.0.attn", lw.FullAttentionSpec, 32),
+            ("model.layers.0.attn", lw.AttentionSpec, 32),
             ("model.layers.0.indexer", IndexerSpec, 8),
         ]
     }
-    spec = (
-        UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs)
+    group = _full_attention_group(
+        specs
         if uniform
-        else specs["model.layers.0.indexer"]
+        else {"model.layers.0.indexer": specs["model.layers.0.indexer"]}
     )
     config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
@@ -894,7 +911,7 @@ def test_connector_accepts_full_attention_subclasses_and_uniform_specs(uniform):
         lw.MooncakeLayerwiseConnector(
             config,
             lw.KVConnectorRole.SCHEDULER,
-            SimpleNamespace(transfer_groups=[SimpleNamespace(kv_cache_spec=spec)]),
+            KVCacheConfig(num_blocks=100, kv_cache_tensors=[], kv_cache_groups=[group]),
         )
 
 

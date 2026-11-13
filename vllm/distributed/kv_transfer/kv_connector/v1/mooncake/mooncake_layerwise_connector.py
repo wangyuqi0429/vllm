@@ -51,13 +51,16 @@ from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
+    FullAttentionManager,
+    MambaManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
     MambaSpec,
-    SlidingWindowSpec,
-    iter_layer_specs,
 )
 
 if TYPE_CHECKING:
@@ -187,30 +190,12 @@ class MooncakeLayerwiseScheduler(MooncakeConnectorScheduler):
         super().__init__(*args, **kwargs)
         self._prefill_requests: dict[str, Request] = {}
         for index, group in enumerate(self.kv_cache_config.transfer_groups):
-            specs = list(iter_layer_specs(group.kv_cache_spec))
-            windows = {getattr(spec, "sliding_window", None) for spec in specs}
-            if len(windows) != 1:
-                raise ValueError("Mixed window semantics within a transfer group")
-            # A windowed FullAttentionSpec still uses the full-attention
-            # manager. Its whole allocated suffix must be populated before D
-            # can publish prefix-cache hashes for those blocks.
-            if next(iter(windows)) is not None and all(
-                isinstance(spec, SlidingWindowSpec) for spec in specs
-            ):
+            policy = group.manager_config
+            if isinstance(policy.params, SlidingWindowManager.Params):
                 self._is_hma_required = True
-                self.blocks_per_sw[index] = max(
-                    (
-                        getattr(
-                            spec,
-                            "num_retained_tokens",
-                            spec.sliding_window - 1 + spec.extra_retained_tokens,
-                        )
-                        + spec.block_size
-                        - 1
-                    )
-                    // spec.block_size
-                    + 1
-                    for spec in specs
+                retained = group.sliding_window_reach
+                self.blocks_per_sw[index] = (
+                    (retained + group.block_size - 1) // group.block_size + 1
                 )
 
     def request_finished(self, request, block_ids):
@@ -503,9 +488,10 @@ class LayerwiseController:
         for kv_cache_name in set(worker._layer_specs) & set(
             meta.registered_layer_names
         ):
-            if isinstance(
-                worker._layer_specs[kv_cache_name], (MambaSpec, CircularBufferSpec)
-            ) and (meta.remote_tp_size != worker.tp_size):
+            group_index = worker.get_group_from_layer_name(kv_cache_name)
+            if worker._is_state_group(group_index) and (
+                meta.remote_tp_size != worker.tp_size
+            ):
                 raise ValueError("Recurrent states currently require equal TP sizes")
             if (
                 meta.cache_specs.get(kv_cache_name)
@@ -549,6 +535,7 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
         if not 0 <= self.send_timeout_margin_s < float("inf"):
             raise ValueError("layerwise_send_timeout_margin_s must be finite and >= 0")
         self.requests_to_send: dict[str, RequestState] = {}
+        self._lease_renewals: SimpleQueue[tuple[list[str], float]] = SimpleQueue()
         # Transfer IDs of requests prefilling in the current scheduler step.
         self.prefilling_transfer_ids: tuple[str, ...] = ()
         self.logical_block_size = self.vllm_config.cache_config.block_size
@@ -602,10 +589,8 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
             name: self._spec_signature(name) for name in self._layer_specs
         }
         self._kernel_block_ratios = tuple(
-            self._physical_blocks_for_spec(
-                next(iter(iter_layer_specs(group.kv_cache_spec)))
-            )
-            for group in self.kv_cache_config.transfer_groups
+            self._physical_blocks_for_group(index)
+            for index in range(len(self.kv_cache_config.transfer_groups))
         )
         self._local_transfer_regions = [
             replace(region, shared_group_ids=(region.group_index,))
@@ -665,7 +650,12 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
 
     def _spec_signature(self, kv_cache_name: str) -> str:
         spec = self._layer_specs[kv_cache_name]
-        if isinstance(spec, CircularBufferSpec):
+        group = self.kv_cache_config.transfer_groups[
+            self.get_group_from_layer_name(kv_cache_name)
+        ]
+        policy = group.manager_config
+        if issubclass(group.manager_cls, CircularBufferManager):
+            assert isinstance(spec, AttentionSpec)
             return repr(
                 (
                     type(spec).__name__,
@@ -684,17 +674,16 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
                     spec.shapes,
                     tuple(str(dtype) for dtype in spec.dtypes),
                     spec.mamba_type,
-                    spec.mamba_cache_mode,
-                    spec.num_speculative_blocks,
-                    spec.num_prefill_checkpoint_blocks,
+                    policy.params,
                     spec.tokens_per_state,
                     spec.tp_replicated,
                 )
             )
+        assert isinstance(spec, AttentionSpec)
         return repr(
             (
                 type(spec).__name__,
-                spec.block_size,
+                group.block_size,
                 str(spec.dtype),
                 spec.head_size,
                 getattr(spec, "head_size_v", None),
@@ -702,9 +691,8 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
                 getattr(spec, "cache_dtype_str", None),
                 str(spec.kv_quant_mode),
                 getattr(spec, "model_version", None),
-                getattr(spec, "sliding_window", None),
-                getattr(spec, "extra_retained_tokens", 0),
-                getattr(spec, "bounded_replay", False),
+                group.manager_cls.__name__,
+                policy.params,
             )
         )
 
@@ -717,23 +705,47 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
     def _preserve_cache_region_identity(self) -> bool:
         return True
 
-    def _physical_blocks_for_spec(self, spec):
-        if isinstance(spec, (MambaSpec, CircularBufferSpec)):
-            return 1
-        if spec.block_size % self.block_size:
-            raise ValueError("Group block size must divide into kernel blocks")
-        return spec.block_size // self.block_size
+    def _is_state_group(self, group_index: int) -> bool:
+        group = self.kv_cache_config.transfer_groups[group_index]
+        return issubclass(group.manager_cls, (MambaManager, CircularBufferManager))
 
-    def receive_kv(self, remote_engine_id, pull_metas):
-        # Query all P stages even for equal PP sizes: layer partitions can differ.
+    def _physical_blocks_for_group(self, group_index: int) -> int:
+        if self._is_state_group(group_index):
+            return 1
+        group = self.kv_cache_config.transfer_groups[group_index]
+        if group.block_size % self.block_size:
+            raise ValueError("Group block size must divide into kernel blocks")
+        return group.block_size // self.block_size
+
+    def _select_remote_workers(self, remote_engine_id):
+        # Equal PP sizes can still have different layer partitions.
         ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
-        addresses = {
-            address
-            for rank in ranks
-            for address in self._remote_agents[remote_engine_id][rank].values()
-        }
+        agents = self._remote_agents[remote_engine_id]
+        return {rank: sorted(agents[rank]) for rank in ranks}
+
+    def _renew_kv_leases(self, transfer_ids):
+        response = super()._renew_kv_leases(transfer_ids)
+        if self._kv_lease_duration is not None:
+            deadline = time.monotonic() + self._kv_lease_duration * 2 / 3
+            self._lease_renewals.put((transfer_ids, deadline))
+        return response
+
+    def _apply_lease_renewals(self) -> None:
+        while True:
+            try:
+                transfer_ids, deadline = self._lease_renewals.get_nowait()
+            except Empty:
+                return
+            for transfer_id in transfer_ids:
+                state = self.requests_to_send.get(transfer_id)
+                if state is not None and state.inference_finished:
+                    state.deadline = max(state.deadline, deadline)
+
+    def receive_kv(self, remote_engine_id, pull_metas):
+        selected = self._select_remote_workers(remote_engine_id)
+        addresses = set(self._remote_worker_addrs(remote_engine_id, selected))
         if not addresses:
             self._handle_failed_recv(pull_metas, list(pull_metas), "No source stages")
             return
@@ -806,7 +818,9 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
             state = self.requests_to_send[transfer_id]
             state.block_ids = tuple(tuple(group) for group in blocks)
             state.inference_finished = True
-            state.deadline = time.monotonic() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+            state.deadline = time.monotonic() + (
+                self._kv_lease_duration or envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+            )
         # Finished requests without a normal handoff are treated as aborted.
         aborted = metadata.reqs_not_processed | {
             transfer_id
@@ -930,16 +944,16 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
         remote_group_block_ids = remote_block_ids[remote_group_index]
         if not remote_group_block_ids:
             return None
-        spec = self._layer_specs[kv_cache_name]
-        block_size = spec.block_size
+        group = self.kv_cache_config.transfer_groups[local_group_index]
+        block_size = group.block_size
         layer_index = self._layer_index_by_name[kv_cache_name]
         available_tokens = state.available_tokens[layer_index]
         final_layer_ready = state.sealed or (
             state.is_final_chunk and available_tokens == state.scheduled_end_tokens
         )
         sent_tokens = state.sent_tokens.get((meta.worker_key, kv_cache_name))
-        is_state = isinstance(spec, (MambaSpec, CircularBufferSpec))
-        is_window = getattr(spec, "sliding_window", None) is not None
+        is_state = self._is_state_group(local_group_index)
+        is_window = isinstance(group.manager_config.params, SlidingWindowManager.Params)
         # State and window caches are sent once, when this layer's final KV is ready.
         if (is_state or is_window) and (
             not final_layer_ready or sent_tokens is not None
@@ -990,6 +1004,7 @@ class MooncakeLayerwiseWorker(MooncakeConnectorWorker):
         """Model thread: snapshot block ranges and retain their destination layouts."""
         if self._pending_sends:
             return
+        self._apply_lease_renewals()
         session_tasks: dict[str, list[LayerwiseSendTask]] = {}
         now = time.monotonic()
         for state in self.requests_to_send.values():
@@ -1187,9 +1202,7 @@ class MooncakeLayerwiseConnector(MooncakeConnector):
             if transfer.get_from_extra_config("pcp_cache_mode", None) != "replicated":
                 raise ValueError("PCP requires explicit pcp_cache_mode=replicated")
             if any(
-                spec.dcp_sharded
-                for group in kv_cache_config.transfer_groups
-                for spec in iter_layer_specs(group.kv_cache_spec)
+                group.dcp_sharded for group in kv_cache_config.transfer_groups
             ):
                 raise ValueError("PCP-sharded cache cannot be sent as a replica")
             if role == KVConnectorRole.WORKER:
@@ -1199,16 +1212,20 @@ class MooncakeLayerwiseConnector(MooncakeConnector):
         groups = kv_cache_config.transfer_groups
         if not groups:
             raise ValueError("Layerwise requires transfer groups")
-        for spec in (
-            spec for group in groups for spec in iter_layer_specs(group.kv_cache_spec)
-        ):
-            if not isinstance(
-                spec,
-                (FullAttentionSpec, SlidingWindowSpec, MambaSpec, CircularBufferSpec),
+        for group in groups:
+            if not issubclass(
+                group.manager_cls,
+                (
+                    FullAttentionManager,
+                    SlidingWindowManager,
+                    MambaManager,
+                    CircularBufferManager,
+                ),
+            ) or any(
+                not isinstance(spec, (AttentionSpec, MambaSpec))
+                for spec in group.distinct_specs
             ):
-                raise ValueError("Layerwise requires full-attention KV specs")
-            if getattr(spec, "attention_chunk_size", None) is not None:
-                raise ValueError("Chunked-local attention is not yet supported")
+                raise ValueError("Unsupported layerwise KV cache group")
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
         self.engine_id = transfer.engine_id
         self.connector_scheduler = None
